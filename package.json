@@ -1,0 +1,35 @@
+{
+  "name": "voxprompt",
+  "version": "0.1.0",
+  "description": "VoxPrompt AI - Multilingual voice-to-prompt Windows desktop agent",
+  "main": "dist/main/index.js",
+  "scripts": {
+    "dev": "cross-env NODE_ENV=development webpack --watch --config webpack.config.js",
+    "build": "cross-env NODE_ENV=production webpack --config webpack.config.js",
+    "start": "electron dist/main/index.js",
+    "build:win": "electron-builder --win"
+  },
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "@types/node": "^25.3.2",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "cross-env": "^10.1.0",
+    "css-loader": "^7.1.4",
+    "electron": "^40.6.1",
+    "electron-builder": "^26.8.1",
+    "html-webpack-plugin": "^5.6.6",
+    "style-loader": "^4.0.0",
+    "tailwindcss": "^4.2.1",
+    "ts-loader": "^9.5.4",
+    "typescript": "^5.9.3",
+    "webpack": "^5.105.3",
+    "webpack-cli": "^6.0.1"
+  },
+  "dependencies": {
+    "dotenv": "^17.3.1",
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4"
+  }
+}
