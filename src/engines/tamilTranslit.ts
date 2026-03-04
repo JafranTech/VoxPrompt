@@ -1,116 +1,71 @@
 /**
- * VoxPrompt AI - Tamil → Roman Transliteration Engine
- *
- * Rule-based Unicode → phoneme mapping for Tamil to Romanized Tamil (Tanglish).
- * Covers all Tamil vowels, consonants, and vowel-marks (maaththirai).
+ * VoxPrompt AI - Tamil → Romanized Tamil (Tanglish) Transliteration Engine
+ * Rule-based Unicode phoneme mapping covering all Tamil vowels, consonants,
+ * vowel-marks (maaththirai), pulli, and visarga per the Tamil Unicode block.
  */
 
-// ─── Vowel-mark (maaththirai) map ────────────────────────────────────────────
-const VOWEL_MARKS: Record<string, string> = {
-    '\u0BBE': 'aa', // ா
-    '\u0BBF': 'i',  // ி
-    '\u0BC0': 'ii', // ீ
-    '\u0BC1': 'u',  // ு
-    '\u0BC2': 'uu', // ூ
-    '\u0BC6': 'e',  // ெ
-    '\u0BC7': 'ee', // ே
-    '\u0BC8': 'ai', // ை
-    '\u0BCA': 'o',  // ொ
-    '\u0BCB': 'oo', // ோ
-    '\u0BCC': 'au', // ௌ
-    '\u0BCD': '',   // ் (pulli — halant, suppresses inherent vowel)
-};
-
-// ─── Independent vowel map ──────────────────────────────────────────────────
+// Independent vowels (U+0B85–U+0B94)
 const VOWELS: Record<string, string> = {
-    '\u0B85': 'a',   // அ
-    '\u0B86': 'aa',  // ஆ
-    '\u0B87': 'i',   // இ
-    '\u0B88': 'ii',  // ஈ
-    '\u0B89': 'u',   // உ
-    '\u0B8A': 'uu',  // ஊ
-    '\u0B8E': 'e',   // எ
-    '\u0B8F': 'ee',  // ஏ
-    '\u0B90': 'ai',  // ஐ
-    '\u0B92': 'o',   // ஒ
-    '\u0B93': 'oo',  // ஓ
-    '\u0B94': 'au',  // ஔ
+    '\u0B85': 'a', '\u0B86': 'aa', '\u0B87': 'i', '\u0B88': 'ii',
+    '\u0B89': 'u', '\u0B8A': 'uu', '\u0B8E': 'e', '\u0B8F': 'ee',
+    '\u0B90': 'ai', '\u0B92': 'o', '\u0B93': 'oo', '\u0B94': 'au',
 };
 
-// ─── Consonant map (with inherent 'a' vowel) ─────────────────────────────────
-const CONSONANTS: Record<string, string> = {
-    '\u0B95': 'ka',  // க
-    '\u0B99': 'nga', // ங
-    '\u0B9A': 'cha', // ச
-    '\u0B9E': 'nya', // ஞ
-    '\u0B9F': 'ta',  // ட
-    '\u0BA3': 'na',  // ண
-    '\u0BA4': 'tha', // த
-    '\u0BA8': 'na',  // ந
-    '\u0BAA': 'pa',  // ப
-    '\u0BAE': 'ma',  // ம
-    '\u0BAF': 'ya',  // ய
-    '\u0BB0': 'ra',  // ர
-    '\u0BB2': 'la',  // ல
-    '\u0BB5': 'va',  // வ
-    '\u0BB4': 'zha', // ழ
-    '\u0BB3': 'la',  // ள
-    '\u0BB1': 'rra', // ற
-    '\u0BA9': 'na',  // ன
-    '\u0B9C': 'ja',  // ஜ
-    '\u0BB6': 'sha', // ஶ
-    '\u0BB7': 'sha', // ஷ
-    '\u0BB8': 'sa',  // ஸ
-    '\u0BB9': 'ha',  // ஹ
+// Vowel diacritics / maaththirai (follow a consonant)
+// The consonant already carries inherent 'a'; we REPLACE that trailing 'a'
+const MARKS: Record<string, string> = {
+    '\u0BBE': 'aa', '\u0BBF': 'i', '\u0BC0': 'ii', '\u0BC1': 'u',
+    '\u0BC2': 'uu', '\u0BC6': 'e', '\u0BC7': 'ee', '\u0BC8': 'ai',
+    '\u0BCA': 'o', '\u0BCB': 'oo', '\u0BCC': 'au',
+    '\u0BCD': '',   // pulli — remove inherent 'a' (pure consonant)
+};
+
+// Consonants with inherent 'a' vowel
+const CONS: Record<string, string> = {
+    '\u0B95': 'ka', '\u0B99': 'nga', '\u0B9A': 'cha', '\u0B9C': 'ja',
+    '\u0B9E': 'nya', '\u0B9F': 'ta', '\u0BA3': 'na', '\u0BA4': 'tha',
+    '\u0BA8': 'na', '\u0BA9': 'na', '\u0BAA': 'pa', '\u0BAE': 'ma',
+    '\u0BAF': 'ya', '\u0BB0': 'ra', '\u0BB1': 'rra', '\u0BB2': 'la',
+    '\u0BB3': 'lla', '\u0BB4': 'zha', '\u0BB5': 'va', '\u0BB6': 'sha',
+    '\u0BB7': 'sha', '\u0BB8': 'sa', '\u0BB9': 'ha',
 };
 
 /**
- * Transliterate a Tamil Unicode string to Romanized Tamil (Tanglish).
- * Handles consonant + vowel-mark combinations correctly.
+ * Transliterate a string that may contain Tamil Unicode characters.
+ * Non-Tamil characters (Latin, digits, spaces, punctuation) pass through unchanged.
  */
 export function transliterateTamil(input: string): string {
     if (!input) return '';
 
+    const chars = [...input];   // Unicode-aware split
     let result = '';
-    const chars = Array.from(input); // handle surrogate pairs
 
     for (let i = 0; i < chars.length; i++) {
         const ch = chars[i];
-        const next = chars[i + 1] || '';
+        const next = chars[i + 1] ?? '';
 
-        // Check consonant first
-        if (CONSONANTS[ch]) {
-            const baseRoman = CONSONANTS[ch]; // includes inherent 'a'
+        if (CONS[ch] !== undefined) {
+            const base = CONS[ch]; // e.g. 'ka'
 
-            if (VOWEL_MARKS[next] !== undefined) {
-                // Vowel mark follows — replace inherent 'a' with the mark's sound
-                const mark = VOWEL_MARKS[next];
+            if (MARKS[next] !== undefined) {
+                const mark = MARKS[next];
                 if (mark === '') {
-                    // Pulli — remove the inherent 'a' (pure consonant)
-                    result += baseRoman.slice(0, -1);
+                    // Pulli: remove trailing inherent 'a' → pure consonant
+                    result += base.slice(0, -1);
                 } else {
-                    // Replace trailing 'a' with mark vowel
-                    result += baseRoman.slice(0, -1) + mark;
+                    // Replace trailing 'a' with the diacritic vowel
+                    result += base.slice(0, -1) + mark;
                 }
-                i++; // consume the mark
+                i++; // consume next (mark)
             } else {
-                result += baseRoman;
+                result += base; // inherent 'a' is kept
             }
-
         } else if (VOWELS[ch]) {
             result += VOWELS[ch];
-
-        } else if (VOWEL_MARKS[ch] !== undefined) {
-            // Orphan mark (shouldn't happen in valid Tamil, skip)
-            result += VOWEL_MARKS[ch];
-
         } else if (ch === '\u0B83') {
-            // Visarga (ஃ) — akh sound
-            result += 'ah';
-
+            result += 'ah'; // Visarga (ஃ)
         } else {
-            // Pass through spaces, punctuation, Latin chars, digits
-            result += ch;
+            result += ch;   // pass-through: Latin, digits, spaces, punctuation
         }
     }
 

@@ -1,18 +1,18 @@
 /**
  * VoxPrompt AI - Electron Main Process
  *
- * PERMANENT FIX for chunked_data_pipe_upload_data_stream Error: -2:
- * Web Speech API requires a SECURE CONTEXT. In Electron 40+ (Chromium 130+),
- * file:// is treated as an opaque origin and fails IsSecureContext() checks,
- * causing Mojo pipe teardown errors during Google Speech API uploads.
- *
- * Solution: Serve the renderer from http://localhost (secure/trusted context).
- * This eliminates ALL chunked upload failures — no flags, no hacks needed.
+ * Architecture:
+ * - Serves renderer from localhost HTTP server (REQUIRED for Web Speech API
+ *   in Electron 40+ — file:// origin fails Chromium's IsSecureContext() check,
+ *   causing chunked_data_pipe_upload Error: -2 on every speech upload)
+ * - Global shortcuts for record/inject and optimize
+ * - System tray background service
+ * - IPC bridge between renderer ↔ main process
  */
 
 import { app } from 'electron';
 
-// Enable media capture before app is ready
+// Must be before app is ready
 app.commandLine.appendSwitch('enable-media-stream');
 app.commandLine.appendSwitch('enable-speech-input');
 
@@ -24,6 +24,7 @@ import {
     nativeImage,
     clipboard,
     session,
+    ipcMain,
 } from 'electron';
 import * as path from 'path';
 import * as http from 'http';
@@ -33,130 +34,133 @@ import { setupIPC } from './ipc';
 let mainWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
 let localServer: http.Server | null = null;
-let serverPort = 0;
 
-// ─── Serve renderer from localhost (permanent Web Speech API fix) ─────────────
-function startLocalServer(): Promise<number> {
-    return new Promise((resolve) => {
-        const rendererDir = path.join(__dirname, '../renderer');
+// ─── Localhost File Server ─────────────────────────────────────────────────────
+// Serves dist/renderer/ from http://127.0.0.1:{port}
+// This gives renderer a "secure context" so Web Speech API works correctly.
+function startLocalServer(rendererDir: string): Promise<number> {
+    return new Promise((resolve, reject) => {
+        const MIME: Record<string, string> = {
+            '.html': 'text/html; charset=utf-8',
+            '.js': 'application/javascript',
+            '.css': 'text/css',
+            '.png': 'image/png',
+            '.ico': 'image/x-icon',
+            '.svg': 'image/svg+xml',
+            '.woff2': 'font/woff2',
+        };
 
         localServer = http.createServer((req, res) => {
-            const urlPath = req.url === '/' ? '/index.html' : req.url || '/index.html';
-            const filePath = path.join(rendererDir, urlPath);
-            const ext = path.extname(filePath);
+            const urlPath = req.url === '/' ? '/index.html' : (req.url || '/index.html');
+            const filePath = path.resolve(rendererDir, '.' + urlPath);
+            const ext = path.extname(filePath).toLowerCase();
 
-            const contentTypes: Record<string, string> = {
-                '.html': 'text/html',
-                '.js': 'application/javascript',
-                '.css': 'text/css',
-                '.png': 'image/png',
-                '.ico': 'image/x-icon',
-            };
+            // Safety: prevent directory traversal
+            if (!filePath.startsWith(rendererDir)) {
+                res.writeHead(403); res.end(); return;
+            }
 
             fs.readFile(filePath, (err, data) => {
-                if (err) {
-                    res.writeHead(404);
-                    res.end('Not found');
-                    return;
-                }
-                res.writeHead(200, { 'Content-Type': contentTypes[ext] || 'text/plain' });
+                if (err) { res.writeHead(404); res.end('Not found'); return; }
+                res.writeHead(200, { 'Content-Type': MIME[ext] || 'application/octet-stream' });
                 res.end(data);
             });
         });
 
-        // Bind to random available port on localhost
+        localServer.on('error', reject);
         localServer.listen(0, '127.0.0.1', () => {
             const addr = localServer!.address() as { port: number };
-            serverPort = addr.port;
-            resolve(serverPort);
+            resolve(addr.port);
         });
     });
 }
 
-async function createWindow() {
-    // Start local HTTP server first
-    const port = await startLocalServer();
-    console.log(`[VoxPrompt] Serving renderer from http://127.0.0.1:${port}`);
+// ─── BrowserWindow ─────────────────────────────────────────────────────────────
+async function createWindow(): Promise<void> {
+    const rendererDir = path.join(__dirname, '../renderer');
+    const port = await startLocalServer(rendererDir);
+
+    console.log(`[VoxPrompt] Renderer served at http://127.0.0.1:${port}`);
 
     mainWindow = new BrowserWindow({
-        width: 400,
-        height: 520,
+        width: 420,
+        height: 580,
         frame: false,
         transparent: true,
         alwaysOnTop: true,
         skipTaskbar: true,
         resizable: false,
+        show: false,
         webPreferences: {
             nodeIntegration: false,
             contextIsolation: true,
             preload: path.join(__dirname, 'preload.js'),
+            // webSecurity must stay true for secure-context benefits to apply
         },
     });
 
     // Grant microphone permission
-    session.defaultSession.setPermissionRequestHandler(
-        (_webContents, permission, callback) => {
-            const allowed = ['media', 'microphone', 'audioCapture'];
-            callback(allowed.includes(permission));
-        }
-    );
-
-    session.defaultSession.setPermissionCheckHandler(
-        (_webContents, permission) => {
-            const allowed = ['media', 'microphone', 'audioCapture'];
-            return allowed.includes(permission);
-        }
-    );
-
-    // Load from localhost — secure context — Web Speech API works correctly
-    mainWindow.loadURL(`http://127.0.0.1:${port}`);
-    mainWindow.hide();
-
-    mainWindow.on('closed', () => {
-        mainWindow = null;
+    session.defaultSession.setPermissionRequestHandler((_wc, permission, cb) => {
+        cb(['media', 'microphone', 'audioCapture'].includes(permission));
     });
+    session.defaultSession.setPermissionCheckHandler((_wc, permission) =>
+        ['media', 'microphone', 'audioCapture'].includes(permission)
+    );
+
+    mainWindow.loadURL(`http://127.0.0.1:${port}`);
+
+    mainWindow.on('closed', () => { mainWindow = null; });
+
+    // Position window near bottom-right for Win+H parity
+    const { screen } = require('electron');
+    const { width: sw, height: sh } = screen.getPrimaryDisplay().workAreaSize;
+    mainWindow.setPosition(sw - 440, sh - 600);
 }
 
-function createTray() {
+// ─── System Tray ───────────────────────────────────────────────────────────────
+function createTray(): void {
     const icon = nativeImage.createEmpty();
     tray = new Tray(icon);
-    const contextMenu = Menu.buildFromTemplate([
-        { label: 'Show VoxPrompt', click: () => mainWindow?.show() },
+    tray.setToolTip('VoxPrompt AI — Press Ctrl+Shift+Space to start');
+    tray.setContextMenu(Menu.buildFromTemplate([
+        { label: 'Open VoxPrompt', click: () => { mainWindow?.show(); mainWindow?.focus(); } },
         { label: 'Hide', click: () => mainWindow?.hide() },
         { type: 'separator' },
         { label: 'Quit', click: () => app.quit() },
-    ]);
-    tray.setToolTip('VoxPrompt AI');
-    tray.setContextMenu(contextMenu);
+    ]));
+    tray.on('click', () => {
+        if (mainWindow?.isVisible()) mainWindow.hide();
+        else { mainWindow?.show(); mainWindow?.focus(); }
+    });
 }
 
+// ─── App Ready ─────────────────────────────────────────────────────────────────
 app.whenReady().then(async () => {
     await createWindow();
     createTray();
+    setupIPC(mainWindow!);
 
-    if (mainWindow) {
-        setupIPC(mainWindow);
-    }
-
-    // SHORTCUT 1 — Ctrl+Shift+Space: Toggle popup + start/stop recording
+    // ── Ctrl+Shift+Space — Toggle popup + start/stop recording ─────────────────
     globalShortcut.register('Ctrl+Shift+Space', () => {
-        if (mainWindow?.isVisible()) {
+        if (!mainWindow) return;
+
+        if (mainWindow.isVisible()) {
             mainWindow.webContents.send('stop-and-inject');
-            mainWindow.hide();
+            // Window hide is handled by the renderer AFTER injection completes
         } else {
-            mainWindow?.show();
-            mainWindow?.focus();
-            mainWindow?.webContents.send('start-recording');
+            mainWindow.show();
+            mainWindow.focus();
+            mainWindow.webContents.send('start-recording');
         }
     });
 
-    // SHORTCUT 2 — Ctrl+Shift+P: AI Prompt Optimizer
+    // ── Ctrl+Shift+P — AI Prompt Optimizer ────────────────────────────────────
     globalShortcut.register('Ctrl+Shift+P', () => {
-        const rawText = clipboard.readText();
-        if (!rawText?.trim()) return;
-        mainWindow?.webContents.send('optimize-text', rawText);
+        const text = clipboard.readText().trim();
+        if (!text) return;
         mainWindow?.show();
         mainWindow?.focus();
+        mainWindow?.webContents.send('optimize-text', text);
     });
 });
 
@@ -165,6 +169,4 @@ app.on('will-quit', () => {
     localServer?.close();
 });
 
-app.on('window-all-closed', () => {
-    // Keep alive in tray
-});
+app.on('window-all-closed', () => { /* keep alive in tray */ });

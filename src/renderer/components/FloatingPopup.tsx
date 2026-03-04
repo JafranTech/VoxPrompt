@@ -1,316 +1,396 @@
 /**
- * VoxPrompt AI - Floating Popup Component
- * Minimalist dark neon voice-to-prompt popup UI
+ * VoxPrompt AI - Main UI Component
+ *
+ * Dark neon floating popup — design spec from DESIGN.md:
+ *   Background: linear-gradient(180deg, #222222 0%, #1A1A1A 100%)
+ *   Accent: #89E900 (neon green)
+ *   CTA: linear-gradient(90deg, #89E900 0%, #6CC400 100%)
  */
 
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { speechEngine } from '../../engines/speechEngine';
+import { transliterateTamil } from '../../engines/tamilTranslit';
 
-export function FloatingPopup() {
-    const [isRecording, setIsRecording] = useState(false);
-    const [language, setLanguage] = useState<'english' | 'tamil'>('english');
+// ─── Typed bridge to window.voxprompt (set by preload) ───────────────────────
+interface VoxBridge {
+    injectText: (text: string) => Promise<void>;
+    optimizePrompt: (text: string) => Promise<string>;
+    hideWindow: () => Promise<void>;
+    onStartRecording: (cb: () => void) => () => void;
+    onStopAndInject: (cb: () => void) => () => void;
+    onOptimizeText: (cb: (_e: any, t: string) => void) => () => void;
+}
+
+const vox = (): VoxBridge => (window as any).voxprompt as VoxBridge;
+
+// ─── Types ────────────────────────────────────────────────────────────────────
+type Lang = 'english' | 'tamil';
+type Status = 'idle' | 'recording' | 'optimizing' | 'injecting' | 'error';
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+const noop = () => { };
+
+export default function FloatingPopup() {
+    const [lang, setLang] = useState<Lang>('english');
     const [transcript, setTranscript] = useState('');
-    const [status, setStatus] = useState<'idle' | 'recording' | 'optimizing' | 'error'>('idle');
-    const [errorMsg, setErrorMsg] = useState('');
+    const [status, setStatus] = useState<Status>('idle');
+    const [errMsg, setErrMsg] = useState('');
+    const [waveScale, setWaveScale] = useState(1);
 
-    // ─── IPC / Bridge ───────────────────────────────────────────────────────────
-    const vox = (window as any).voxprompt as {
-        injectText: (text: string) => Promise<void>;
-        optimizePrompt: (text: string) => Promise<string>;
-        hideWindow: () => Promise<void>;
-        onStartRecording: (cb: () => void) => () => void;
-        onStopAndInject: (cb: () => void) => () => void;
-        onOptimizeText: (cb: (_: any, text: string) => void) => () => void;
-    };
-
-    // ─── Ref to keep transcript accessible inside callbacks without stale closure
-    const transcriptRef = useRef(transcript);
+    // Keep transcript ref for stale-closure safety
+    const transcriptRef = useRef('');
     useEffect(() => { transcriptRef.current = transcript; }, [transcript]);
 
-    // ─── Accumulated transcript across all utterance segments ──────────────────
-    const accumulatedRef = useRef('');
+    // Accumulate finalized speech segments across utterance boundaries
+    const finalizedRef = useRef('');
 
-    // ─── Speech helpers ──────────────────────────────────────────────────────────
+    // Wave animation while recording
+    const waveRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+    const startWave = () => {
+        waveRef.current = setInterval(() => {
+            setWaveScale(0.85 + Math.random() * 0.3);
+        }, 200);
+    };
+    const stopWave = () => {
+        if (waveRef.current) { clearInterval(waveRef.current); waveRef.current = null; }
+        setWaveScale(1);
+    };
+
+    // ─── startRecording ──────────────────────────────────────────────────────────
     const startRecording = useCallback(() => {
-        // Guard: don't start if already running
-        if (speechEngine.running) {
-            console.log('[FloatingPopup] Already recording, ignoring start signal.');
-            return;
-        }
+        if (speechEngine.running) return;
 
-        const lang = language === 'tamil' ? 'ta-IN' : 'en-US';
-        accumulatedRef.current = '';
+        finalizedRef.current = '';
         setTranscript('');
-        setErrorMsg('');
+        setErrMsg('');
 
-        const ok = speechEngine.initialize(lang);
+        const ok = speechEngine.initialize(lang === 'tamil' ? 'ta-IN' : 'en-US');
         if (!ok) {
             setStatus('error');
-            setErrorMsg('Speech API not available in this environment.');
+            setErrMsg('Speech API unavailable. Ensure app is served from localhost.');
             return;
         }
 
-        // ─── FIX: Accumulate both interim and final results ───────────────────────
-        // Store final segments in accumulatedRef so switching to a final segment
-        // doesn't wipe out what was already confirmed.
-        let finalizedText = '';
+        let finalized = '';
 
         speechEngine.onResult((text, isFinal) => {
+            // Apply Tamil transliteration if needed
+            const processed = lang === 'tamil' ? transliterateTamil(text) : text;
+
             if (isFinal) {
-                finalizedText += text + ' ';
-                accumulatedRef.current = finalizedText;
-                setTranscript(finalizedText.trim());
+                finalized += processed + ' ';
+                finalizedRef.current = finalized;
+                setTranscript(finalized.trim());
             } else {
-                // Show interim result appended to finalized
-                setTranscript((finalizedText + text).trim());
+                setTranscript((finalized + processed).trim());
             }
         });
 
         speechEngine.onEnd(() => {
-            // SpeechEngine handles auto-restart internally.
-            // This callback only fires on explicit stop().
-            setIsRecording(false);
             setStatus('idle');
+            stopWave();
         });
 
         speechEngine.onError((err) => {
             if (err === 'not-allowed' || err === 'service-not-allowed') {
                 setStatus('error');
-                setErrorMsg('Microphone permission denied. Check Electron permissions.');
-                setIsRecording(false);
+                setErrMsg('Microphone access denied. Grant permission in OS settings.');
+                stopWave();
             }
-            // Other errors (network, aborted) are handled by auto-restart in engine
         });
 
         speechEngine.start();
-        setIsRecording(true);
         setStatus('recording');
-    }, [language]);
+        startWave();
+    }, [lang]);
 
+    // ─── stopAndInject ────────────────────────────────────────────────────────────
     const stopAndInject = useCallback(async () => {
         speechEngine.stop();
-        setIsRecording(false);
-        setStatus('idle');
+        stopWave();
+        setStatus('injecting');
 
-        const text = accumulatedRef.current.trim() || transcriptRef.current.trim();
+        const text = (finalizedRef.current || transcriptRef.current).trim();
+
         if (text) {
             try {
-                await vox.injectText(text);
-                setTranscript('');
-                accumulatedRef.current = '';
+                await vox().injectText(text);
             } catch (e) {
-                console.error('[FloatingPopup] Injection failed:', e);
+                console.error('[FloatingPopup] Injection failed', e);
             }
         }
-    }, [vox]);
 
-    // ─── IPC listeners from main process ────────────────────────────────────────
-    useEffect(() => {
-        if (!vox) return;
-
-        const unsubRecord = vox.onStartRecording(() => startRecording());
-        const unsubStop = vox.onStopAndInject(() => stopAndInject());
-        const unsubOptimize = vox.onOptimizeText((_: any, text: string) => {
-            setTranscript(text);
-            setStatus('optimizing');
-        });
-
-        return () => {
-            unsubRecord?.();
-            unsubStop?.();
-            unsubOptimize?.();
-        };
-        // Intentionally NOT including startRecording/stopAndInject in deps
-        // to avoid re-registering listeners on every render.
-        // eslint-disable-next-line react-hooks/exhaustive-deps
+        // Reset for next use
+        setTranscript('');
+        finalizedRef.current = '';
+        setStatus('idle');
+        // Window is hidden by main on Ctrl+Shift+Space toggle
     }, []);
 
-    // ─── Render ──────────────────────────────────────────────────────────────────
+    // ─── IPC listeners ────────────────────────────────────────────────────────────
+    useEffect(() => {
+        const bridge = vox();
+        const unsub1 = bridge.onStartRecording(() => startRecording());
+        const unsub2 = bridge.onStopAndInject(() => stopAndInject());
+        const unsub3 = bridge.onOptimizeText((_e, text) => {
+            setTranscript(text);
+            finalizedRef.current = text;
+            setStatus('idle');
+        });
+        return () => { unsub1?.(); unsub2?.(); unsub3?.(); };
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []); // mount once — startRecording/stopAndInject captured via refs below
+
+    // ─── Colour helpers ───────────────────────────────────────────────────────────
+    const isRecording = status === 'recording';
+    const isOptimizing = status === 'optimizing';
+    const isInjecting = status === 'injecting';
+    const isError = status === 'error';
+
+    const statusColor =
+        isRecording ? '#89E900' :
+            isOptimizing ? '#FFB800' :
+                isInjecting ? '#00C8FF' :
+                    isError ? '#FF4545' :
+                        '#555';
+
+    const statusLabel =
+        isRecording ? '● RECORDING' :
+            isOptimizing ? '⚙ OPTIMIZING…' :
+                isInjecting ? '↗ INJECTING…' :
+                    isError ? `✕ ${errMsg}` :
+                        'TAP TO SPEAK';
+
+    // ─── Render ───────────────────────────────────────────────────────────────────
     return (
-        <div
-            style={{
-                width: '400px',
-                height: '520px',
-                background: 'linear-gradient(180deg, #222222 0%, #1A1A1A 100%)',
-                borderRadius: '12px',
-                boxShadow: '0 8px 32px rgba(0,0,0,0.6)',
-                display: 'flex',
-                flexDirection: 'column',
-                padding: '20px',
-                fontFamily: "'Space Grotesk', 'Segoe UI', sans-serif",
-                boxSizing: 'border-box',
-                userSelect: 'none',
-            }}
-        >
-            {/* 1. Top Bar */}
+        <div style={{
+            width: '400px', height: '540px',
+            background: 'linear-gradient(180deg, #242424 0%, #181818 100%)',
+            borderRadius: '16px',
+            border: '1px solid rgba(255,255,255,0.06)',
+            boxShadow: '0 20px 60px rgba(0,0,0,0.7), 0 0 0 1px rgba(137,233,0,0.08)',
+            display: 'flex', flexDirection: 'column',
+            padding: '22px 20px 18px',
+            fontFamily: "'Inter', 'Segoe UI', system-ui, sans-serif",
+            boxSizing: 'border-box',
+            userSelect: 'none',
+            overflow: 'hidden',
+            position: 'relative',
+        }}>
+
+            {/* Glow orb behind mic button */}
+            {isRecording && (
+                <div style={{
+                    position: 'absolute', top: '170px', left: '50%',
+                    transform: 'translateX(-50%)',
+                    width: '120px', height: '120px',
+                    background: 'radial-gradient(circle, rgba(137,233,0,0.18) 0%, transparent 70%)',
+                    borderRadius: '50%',
+                    pointerEvents: 'none',
+                    transition: 'transform 0.2s',
+                    scale: String(waveScale),
+                }} />
+            )}
+
+            {/* ── Top Bar ── */}
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '18px' }}>
-                <span style={{ color: '#FFFFFF', fontWeight: 700, fontSize: '16px', letterSpacing: '0.5px' }}>
-                    VoxPrompt AI
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                    <div style={{
+                        width: '8px', height: '8px', borderRadius: '50%',
+                        background: isError ? '#FF4545' : isRecording ? '#89E900' : '#444',
+                        boxShadow: isRecording ? '0 0 8px #89E900, 0 0 18px rgba(137,233,0,0.5)' : 'none',
+                        transition: 'all 0.3s',
+                        animation: isRecording ? 'pulse 1.5s ease-in-out infinite' : 'none',
+                    }} />
+                    <span style={{ color: '#fff', fontWeight: 700, fontSize: '15px', letterSpacing: '0.3px' }}>
+                        VoxPrompt <span style={{ color: '#89E900' }}>AI</span>
+                    </span>
+                </div>
+                <span style={{
+                    fontSize: '10px', color: '#555', letterSpacing: '1.5px', textTransform: 'uppercase',
+                    fontWeight: 500,
+                }}>
+                    v0.1
                 </span>
-                <div
-                    title={isRecording ? 'Recording active' : 'Idle'}
-                    style={{
-                        width: '10px',
-                        height: '10px',
-                        borderRadius: '50%',
-                        backgroundColor: status === 'error' ? '#FF4444' : isRecording ? '#89E900' : '#555555',
-                        boxShadow: isRecording ? '0 0 6px #89E900' : 'none',
-                        transition: 'background-color 0.3s, box-shadow 0.3s',
-                    }}
-                />
             </div>
 
-            {/* 2. Language Selector */}
-            <div style={{ marginBottom: '22px', textAlign: 'center' }}>
-                <select
-                    value={language}
-                    onChange={(e) => setLanguage(e.target.value as 'english' | 'tamil')}
-                    disabled={isRecording}
-                    style={{
-                        background: '#2A2A2A',
-                        color: '#FFFFFF',
-                        border: '1px solid #444444',
-                        borderRadius: '8px',
-                        padding: '8px 16px',
-                        fontSize: '14px',
-                        cursor: isRecording ? 'not-allowed' : 'pointer',
-                        outline: 'none',
-                        width: '180px',
-                        appearance: 'none',
-                        opacity: isRecording ? 0.5 : 1,
-                        textAlign: 'center',
-                        transition: 'opacity 0.2s',
-                    }}
-                    onFocus={(e) => (e.currentTarget.style.borderColor = '#89E900')}
-                    onBlur={(e) => (e.currentTarget.style.borderColor = '#444444')}
-                >
-                    <option value="english">English</option>
-                    <option value="tamil">Tamil</option>
-                </select>
+            {/* ── Language Selector ── */}
+            <div style={{ display: 'flex', gap: '8px', marginBottom: '20px' }}>
+                {(['english', 'tamil'] as Lang[]).map((l) => (
+                    <button
+                        key={l}
+                        disabled={isRecording}
+                        onClick={() => setLang(l)}
+                        style={{
+                            flex: 1, padding: '8px', borderRadius: '10px', border: 'none',
+                            fontSize: '13px', fontWeight: 600, letterSpacing: '0.5px',
+                            cursor: isRecording ? 'not-allowed' : 'pointer',
+                            transition: 'all 0.2s',
+                            background: lang === l ? 'rgba(137,233,0,0.15)' : 'rgba(255,255,255,0.04)',
+                            color: lang === l ? '#89E900' : '#666',
+                            boxShadow: lang === l ? 'inset 0 0 0 1px rgba(137,233,0,0.4)' : 'inset 0 0 0 1px rgba(255,255,255,0.06)',
+                        }}
+                    >
+                        {l === 'english' ? '🇺🇸 English' : '🇮🇳 Tamil'}
+                    </button>
+                ))}
             </div>
 
-            {/* 3. Microphone Button */}
-            <div style={{ display: 'flex', justifyContent: 'center', marginBottom: '22px' }}>
+            {/* ── Mic Button ── */}
+            <div style={{ display: 'flex', justifyContent: 'center', marginBottom: '16px' }}>
                 <button
-                    id="mic-button"
+                    id="mic-btn"
                     onClick={isRecording ? stopAndInject : startRecording}
-                    title={isRecording ? 'Stop & Inject' : 'Start Recording'}
+                    disabled={isOptimizing || isInjecting}
+                    title={isRecording ? 'Stop & inject text' : 'Start voice recording'}
                     style={{
-                        width: '80px',
-                        height: '80px',
-                        borderRadius: '50%',
-                        border: 'none',
-                        cursor: 'pointer',
-                        backgroundColor: isRecording ? '#89E900' : '#333333',
+                        width: '84px', height: '84px', borderRadius: '50%',
+                        border: isRecording ? '2px solid rgba(137,233,0,0.6)' : '2px solid rgba(255,255,255,0.08)',
+                        cursor: (isOptimizing || isInjecting) ? 'not-allowed' : 'pointer',
+                        background: isRecording
+                            ? 'linear-gradient(135deg, #89E900, #6CC400)'
+                            : 'linear-gradient(135deg, #2A2A2A, #1E1E1E)',
                         boxShadow: isRecording
-                            ? '0 0 20px rgba(137, 233, 0, 0.6), 0 0 40px rgba(137, 233, 0, 0.3)'
-                            : '0 4px 12px rgba(0,0,0,0.4)',
-                        display: 'flex',
-                        alignItems: 'center',
-                        justifyContent: 'center',
-                        transition: 'background-color 0.25s, box-shadow 0.25s',
+                            ? `0 0 ${20 + waveScale * 15}px rgba(137,233,0,0.5), 0 8px 24px rgba(0,0,0,0.5)`
+                            : '0 8px 24px rgba(0,0,0,0.5)',
+                        display: 'flex', alignItems: 'center', justifyContent: 'center',
+                        transition: 'background 0.25s, box-shadow 0.2s, border-color 0.25s',
                         outline: 'none',
+                        transform: `scale(${isRecording ? waveScale * 0.95 + 0.05 : 1})`,
                     }}
                 >
-                    <svg width="32" height="32" viewBox="0 0 24 24" fill={isRecording ? '#1A1A1A' : '#89E900'}>
-                        <path d="M12 1a4 4 0 0 1 4 4v6a4 4 0 0 1-8 0V5a4 4 0 0 1 4-4zm0 2a2 2 0 0 0-2 2v6a2 2 0 0 0 4 0V5a2 2 0 0 0-2-2z" />
-                        <path d="M19 10a1 1 0 0 1 1 1 8 8 0 0 1-16 0 1 1 0 0 1 2 0 6 6 0 0 0 12 0 1 1 0 0 1 1-1z" />
-                        <path d="M12 19a1 1 0 0 1 1 1v2a1 1 0 0 1-2 0v-2a1 1 0 0 1 1-1z" />
-                        <path d="M9 22a1 1 0 0 1 0-2h6a1 1 0 0 1 0 2H9z" />
+                    {/* Mic SVG */}
+                    <svg width="34" height="34" viewBox="0 0 24 24" fill="none">
+                        <rect x="9" y="2" width="6" height="11" rx="3"
+                            fill={isRecording ? '#1A1A1A' : '#89E900'} />
+                        <path d="M5 11a7 7 0 0014 0" stroke={isRecording ? '#1A1A1A' : '#89E900'}
+                            strokeWidth="1.8" strokeLinecap="round" fill="none" />
+                        <line x1="12" y1="18" x2="12" y2="22"
+                            stroke={isRecording ? '#1A1A1A' : '#89E900'} strokeWidth="1.8" strokeLinecap="round" />
+                        <line x1="8" y1="22" x2="16" y2="22"
+                            stroke={isRecording ? '#1A1A1A' : '#89E900'} strokeWidth="1.8" strokeLinecap="round" />
                     </svg>
                 </button>
             </div>
 
-            {/* Status label */}
-            <div style={{ textAlign: 'center', marginBottom: '14px', height: '18px' }}>
-                <span
-                    style={{
-                        color:
-                            status === 'recording' ? '#89E900' :
-                                status === 'optimizing' ? '#FFA500' :
-                                    status === 'error' ? '#FF4444' : '#555555',
-                        fontSize: '12px',
-                        fontWeight: 500,
-                        letterSpacing: '1.2px',
-                        textTransform: 'uppercase',
-                        transition: 'color 0.3s',
-                    }}
-                >
-                    {status === 'recording' ? '● Recording' :
-                        status === 'optimizing' ? '⚙ Optimizing...' :
-                            status === 'error' ? `✕ ${errorMsg || 'Error'}` :
-                                'Tap to Speak'}
-                </span>
+            {/* ── Status Label ── */}
+            <div style={{
+                textAlign: 'center', marginBottom: '14px', height: '16px',
+                fontSize: '11px', fontWeight: 600, letterSpacing: '1.8px',
+                color: statusColor,
+                transition: 'color 0.3s',
+            }}>
+                {statusLabel}
             </div>
 
-            {/* 4. Transcription Area */}
+            {/* ── Transcript Area ── */}
             <textarea
-                id="transcript-area"
+                id="transcript"
                 value={transcript}
                 onChange={(e) => {
                     setTranscript(e.target.value);
-                    accumulatedRef.current = e.target.value;
+                    finalizedRef.current = e.target.value;
                 }}
-                placeholder="Your speech will appear here..."
+                placeholder="Your speech will appear here…&#10;Start speaking after pressing the mic."
                 style={{
                     flex: 1,
-                    backgroundColor: '#111111',
-                    color: '#FFFFFF',
-                    border: 'none',
-                    borderRadius: '8px',
-                    padding: '12px',
+                    background: 'rgba(0,0,0,0.35)',
+                    border: '1px solid rgba(255,255,255,0.07)',
+                    borderRadius: '10px',
+                    padding: '12px 14px',
+                    color: '#e8e8e8',
                     fontSize: '14px',
-                    lineHeight: '1.6',
+                    lineHeight: '1.7',
                     resize: 'none',
                     outline: 'none',
-                    boxShadow: 'inset 0 2px 8px rgba(0,0,0,0.5)',
                     fontFamily: 'inherit',
-                    marginBottom: '16px',
+                    marginBottom: '14px',
+                    boxShadow: 'inset 0 2px 8px rgba(0,0,0,0.4)',
+                    transition: 'border-color 0.2s',
                 }}
+                onFocus={(e) => e.currentTarget.style.borderColor = 'rgba(137,233,0,0.3)'}
+                onBlur={(e) => e.currentTarget.style.borderColor = 'rgba(255,255,255,0.07)'}
             />
 
-            {/* 5. CTA Button */}
-            <button
-                id="convert-btn"
-                onClick={async () => {
-                    const text = transcript.trim();
-                    if (!text) return;
-                    setStatus('optimizing');
-                    try {
-                        const result = await vox.optimizePrompt(text);
-                        if (result) {
-                            setTranscript(result);
-                            accumulatedRef.current = result;
+            {/* ── Action Buttons ── */}
+            <div style={{ display: 'flex', gap: '10px' }}>
+                {/* Inject raw text */}
+                <button
+                    onClick={stopAndInject}
+                    disabled={!transcript.trim() || status === 'injecting'}
+                    style={btnStyle('ghost', !transcript.trim() || status === 'injecting')}
+                    title="Stop recording and inject raw text into active app"
+                >
+                    ↗ Inject
+                </button>
+
+                {/* Convert to Prompt */}
+                <button
+                    id="convert-btn"
+                    disabled={!transcript.trim() || isOptimizing}
+                    onClick={async () => {
+                        const text = transcriptRef.current.trim();
+                        if (!text) return;
+                        setStatus('optimizing');
+                        try {
+                            const result = await vox().optimizePrompt(text);
+                            if (result) {
+                                setTranscript(result);
+                                finalizedRef.current = result;
+                            }
+                        } catch (e) {
+                            console.error(e);
+                        } finally {
+                            setStatus('idle');
                         }
-                    } finally {
-                        setStatus('idle');
-                    }
-                }}
-                style={{
-                    width: '100%',
-                    padding: '14px',
-                    background: 'linear-gradient(90deg, #89E900 0%, #6CC400 100%)',
-                    color: '#FFFFFF',
-                    fontWeight: 700,
-                    fontSize: '15px',
-                    border: 'none',
-                    borderRadius: '10px',
-                    cursor: 'pointer',
-                    letterSpacing: '0.5px',
-                    transition: 'opacity 0.2s, transform 0.1s',
-                    outline: 'none',
-                    opacity: status === 'optimizing' ? 0.7 : 1,
-                }}
-                disabled={status === 'optimizing'}
-                onMouseEnter={(e) => { e.currentTarget.style.opacity = '0.88'; e.currentTarget.style.transform = 'translateY(-1px)'; }}
-                onMouseLeave={(e) => { e.currentTarget.style.opacity = '1'; e.currentTarget.style.transform = 'translateY(0)'; }}
-                onMouseDown={(e) => (e.currentTarget.style.transform = 'translateY(1px)')}
-                onMouseUp={(e) => (e.currentTarget.style.transform = 'translateY(-1px)')}
-            >
-                {status === 'optimizing' ? 'Optimizing...' : 'Convert to Prompt'}
-            </button>
+                    }}
+                    style={btnStyle('primary', !transcript.trim() || isOptimizing)}
+                >
+                    {isOptimizing ? '⚙ Optimizing…' : '✦ Convert to Prompt'}
+                </button>
+            </div>
+
+            {/* Pulse keyframe — injected as a style tag */}
+            <style>{`
+        @keyframes pulse {
+          0%, 100% { opacity: 1; }
+          50%       { opacity: 0.4; }
+        }
+      `}</style>
         </div>
     );
 }
 
-export default FloatingPopup;
+// ─── Button Style Helper ──────────────────────────────────────────────────────
+function btnStyle(variant: 'primary' | 'ghost', disabled: boolean): React.CSSProperties {
+    const base: React.CSSProperties = {
+        flex: variant === 'primary' ? 2 : 1,
+        padding: '12px',
+        borderRadius: '10px',
+        border: 'none',
+        fontSize: '13px',
+        fontWeight: 700,
+        letterSpacing: '0.4px',
+        cursor: disabled ? 'not-allowed' : 'pointer',
+        opacity: disabled ? 0.4 : 1,
+        transition: 'all 0.18s',
+        outline: 'none',
+    };
+
+    if (variant === 'primary') {
+        return {
+            ...base,
+            background: 'linear-gradient(90deg, #89E900, #6CC400)',
+            color: '#111',
+            boxShadow: disabled ? 'none' : '0 4px 16px rgba(137,233,0,0.25)',
+        };
+    }
+
+    return {
+        ...base,
+        background: 'rgba(255,255,255,0.06)',
+        color: '#888',
+        boxShadow: 'inset 0 0 0 1px rgba(255,255,255,0.09)',
+    };
+}

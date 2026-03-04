@@ -1,110 +1,108 @@
 /**
  * VoxPrompt AI - AI Prompt Optimizer Agent
  *
- * Converts raw speech text into structured LLM-ready prompts.
- * Uses the OpenAI-compatible API (works with Claude, GPT-4, etc.)
- * API key stored in .env — never exposed to renderer.
+ * Converts raw speech into structured LLM-ready prompts.
+ * - Calls LLM API if LLM_API_KEY is set in .env
+ * - Falls back to a well-structured template otherwise
+ * - Detects voice command triggers from AI_AGENT_RULES.md
  */
 
 import * as dotenv from 'dotenv';
 dotenv.config();
 
-// ─── Structured prompt template per AI_AGENT_RULES.md ───────────────────────
-function buildTemplate(rawText: string): string {
-    return [
-        `Task: ${rawText.trim()}`,
-        `Context: [Extracted from spoken input — expand as needed]`,
-        `Requirements: [Define specific deliverables]`,
-        `Constraints: [No specific constraints unless stated]`,
-        `Expected Output Format: [Structured, clear, actionable response]`,
-    ].join('\n');
-}
-
-// ─── LLM API call (OpenAI-compatible) ────────────────────────────────────────
-async function callLLM(rawText: string): Promise<string> {
-    const apiKey = process.env.LLM_API_KEY;
-    const apiUrl = process.env.LLM_API_URL || 'https://api.openai.com/v1/chat/completions';
-    const model = process.env.LLM_MODEL || 'gpt-4o-mini';
-
-    if (!apiKey) {
-        console.warn('[PromptOptimizer] No LLM_API_KEY in .env — using template fallback.');
-        return buildTemplate(rawText);
-    }
-
-    const systemPrompt = [
-        'You are an expert prompt engineer.',
-        'Convert the user\'s raw speech or text into a structured LLM prompt.',
-        'Follow this exact format:',
-        'Task: <one line description of what is being asked>',
-        'Context: <background information extracted from input>',
-        'Requirements: <specific deliverables or constraints>',
-        'Constraints: <limitations, scope restrictions>',
-        'Expected Output Format: <how the response should be structured>',
-        'Be concise but thorough. Do not add commentary. Output only the structured prompt.',
-    ].join('\n');
-
-    try {
-        const response = await fetch(apiUrl, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${apiKey}`,
-            },
-            body: JSON.stringify({
-                model,
-                messages: [
-                    { role: 'system', content: systemPrompt },
-                    { role: 'user', content: rawText },
-                ],
-                max_tokens: 400,
-                temperature: 0.3,
-            }),
-        });
-
-        if (!response.ok) {
-            const err = await response.text();
-            console.error('[PromptOptimizer] API error:', err);
-            return buildTemplate(rawText);
-        }
-
-        const data: any = await response.json();
-        return data.choices?.[0]?.message?.content?.trim() || buildTemplate(rawText);
-
-    } catch (err) {
-        console.error('[PromptOptimizer] Fetch failed:', err);
-        return buildTemplate(rawText);
-    }
-}
-
-// ─── Command detection per AI_AGENT_RULES.md ────────────────────────────────
-const TRIGGER_PHRASES = [
+// ─── Trigger phrases (AI_AGENT_RULES.md) ─────────────────────────────────────
+const TRIGGERS = [
     'convert this into prompt',
+    'convert to prompt',
     'make this professional',
     'optimize for llm',
+    'optimize for ai',
     'structure this',
-    'convert to prompt',
+    'make it formal',
 ];
 
-function detectCommand(text: string): boolean {
-    const lower = text.toLowerCase().trim();
-    return TRIGGER_PHRASES.some((phrase) => lower.includes(phrase));
+function stripTrigger(text: string): string {
+    const lower = text.toLowerCase();
+    for (const t of TRIGGERS) {
+        if (lower.includes(t)) {
+            return text.toLowerCase().replace(t, '').trim() || text;
+        }
+    }
+    return text;
 }
 
-/**
- * Main optimization entry point, called from IPC handler.
- * Always returns a string — never throws to renderer.
- */
-export async function optimizePrompt(rawText: string): Promise<string> {
-    if (!rawText?.trim()) return '';
+// ─── Structured template fallback ─────────────────────────────────────────────
+function buildTemplate(raw: string): string {
+    // Attempt to extract a rough task description
+    const words = raw.trim().split(/\s+/);
+    const preview = words.slice(0, 12).join(' ') + (words.length > 12 ? '…' : '');
 
-    // Strip trigger phrases from the text if found
-    let cleanText = rawText;
-    if (detectCommand(rawText)) {
-        for (const phrase of TRIGGER_PHRASES) {
-            cleanText = cleanText.toLowerCase().replace(phrase, '').trim();
-        }
-        if (!cleanText) cleanText = rawText;
+    return [
+        `Task: ${preview}`,
+        `Context: ${raw.trim()}`,
+        `Requirements: Define specific deliverables and scope.`,
+        `Constraints: No specific constraints unless stated in the context above.`,
+        `Expected Output Format: Clear, structured, and actionable response.`,
+    ].join('\n');
+}
+
+// ─── LLM API call ─────────────────────────────────────────────────────────────
+const SYSTEM_PROMPT = `You are an expert prompt engineer.
+Convert the user's raw speech or text into a structured LLM-ready prompt.
+Use exactly this format — no extra commentary:
+
+Task: <concise description of what is being requested>
+Context: <background and key details from the user's input>
+Requirements: <specific deliverables, steps, or expectations>
+Constraints: <limitations, scope restrictions, or caveats>
+Expected Output Format: <how the final response should be structured>
+
+Be thorough but concise. Do not include any text before or after the five fields.`;
+
+async function callLLM(text: string): Promise<string> {
+    const key = process.env.LLM_API_KEY?.trim();
+    const url = process.env.LLM_API_URL || 'https://api.openai.com/v1/chat/completions';
+    const model = process.env.LLM_MODEL || 'gpt-4o-mini';
+
+    if (!key || key.startsWith('sk-ant-YOUR')) {
+        return buildTemplate(text);
     }
 
-    return callLLM(cleanText);
+    const resp = await fetch(url, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${key}`,
+        },
+        body: JSON.stringify({
+            model,
+            messages: [
+                { role: 'system', content: SYSTEM_PROMPT },
+                { role: 'user', content: text },
+            ],
+            max_tokens: 500,
+            temperature: 0.25,
+        }),
+        signal: AbortSignal.timeout(15_000),
+    });
+
+    if (!resp.ok) {
+        console.error('[PromptOptimizer] API responded', resp.status, await resp.text());
+        return buildTemplate(text);
+    }
+
+    const json: any = await resp.json();
+    return json.choices?.[0]?.message?.content?.trim() || buildTemplate(text);
+}
+
+// ─── Public API ───────────────────────────────────────────────────────────────
+export async function optimizePrompt(rawText: string): Promise<string> {
+    if (!rawText?.trim()) return '';
+    const cleaned = stripTrigger(rawText);
+    try {
+        return await callLLM(cleaned);
+    } catch (err) {
+        console.error('[PromptOptimizer] Error:', err);
+        return buildTemplate(cleaned);
+    }
 }
