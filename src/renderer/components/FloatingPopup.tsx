@@ -21,7 +21,19 @@ interface VoxBridge {
     onOptimizeText: (cb: (_e: any, t: string) => void) => () => void;
 }
 
-const vox = (): VoxBridge => (window as any).voxprompt as VoxBridge;
+// Null-safe bridge: returns no-op stubs if preload hasn't loaded yet.
+// This prevents silent React crashes during Electron renderer init.
+const NO_OP_UNSUB = () => { };
+const VOX_STUB: VoxBridge = {
+    injectText: async () => { },
+    optimizePrompt: async (t) => t,
+    hideWindow: async () => { },
+    onStartRecording: () => NO_OP_UNSUB,
+    onStopAndInject: () => NO_OP_UNSUB,
+    onOptimizeText: () => NO_OP_UNSUB,
+};
+
+const vox = (): VoxBridge => (window as any).voxprompt ?? VOX_STUB;
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 type Lang = 'english' | 'tamil';
