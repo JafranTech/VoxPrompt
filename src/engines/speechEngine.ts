@@ -1,126 +1,92 @@
 /**
- * VoxPrompt AI - Speech Recognition Engine
+ * VoxPrompt AI - Audio Recording Engine (MediaRecorder)
  *
- * IMPORTANT — Why we always BUILD A FRESH INSTANCE on restart (not reuse):
- * Chromium's Web Speech API maintains a Mojo DataPipe to stream audio chunks
- * to Google's speech servers. Calling recognition.stop() initiates an async
- * flush of remaining audio through this pipe. If recognition.start() is called
- * on the SAME instance before the flush completes, the new session grabs the
- * OS audio device — destroying the old Mojo pipe's producer handle mid-flush —
- * causing `chunked_data_pipe_upload_data_stream.cc Error: -2` (ERR_FAILED).
- *
- * Fix: use abort() (flushes nothing, closes pipe immediately), then null the
- * instance (allow GC to free C++ handles), wait 500ms for OS audio device
- * release, then create a brand new SpeechRecognition object.
+ * Captures microphone audio to a Blob to be sent to Gemini Audio API.
  */
 
 export class SpeechEngine {
-    private Ctor: any = null;
-    private rec: any = null;
+    private mediaRecorder: MediaRecorder | null = null;
+    private audioChunks: Blob[] = [];
+    private stream: MediaStream | null = null;
 
-    private onResultCb: ((text: string, isFinal: boolean) => void) | null = null;
-    private onEndCb: (() => void) | null = null;
+    private onEndCb: ((audioBlob: Blob, mimeType: string) => void) | null = null;
     private onErrorCb: ((err: string) => void) | null = null;
 
-    private _active = false;   // we WANT audio running
-    private _stopping = false;   // explicit stop requested
-    private _lang: 'en-US' | 'ta-IN' = 'en-US';
-    private _restartTmr: ReturnType<typeof setTimeout> | null = null;
+    private _active = false;
 
-    /** Must be called before start(). Safe to call again to change language. */
-    initialize(language: 'en-US' | 'ta-IN'): boolean {
-        const S = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-        if (!S) {
-            console.error('[SpeechEngine] Web Speech API unavailable.');
+    async initialize(): Promise<boolean> {
+        try {
+            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            // Release immediately, just checking permission
+            stream.getTracks().forEach(t => t.stop());
+            return true;
+        } catch (err) {
+            console.error('[SpeechEngine] Init error:', err);
             return false;
         }
-        if (this._active) this._doAbort();
-        this.Ctor = S;
-        this._lang = language;
-        return true;
     }
 
-    // Build a fresh recognition instance — NEVER reuse a stopped one
-    private _build(): void {
-        const r = new this.Ctor();
-        r.continuous = true;
-        r.interimResults = true;
-        r.lang = this._lang;
-        r.maxAlternatives = 1;
+    async start(): Promise<void> {
+        if (this._active) return;
 
-        r.onresult = (e: any) => {
-            for (let i = e.resultIndex; i < e.results.length; i++) {
-                this.onResultCb?.(e.results[i][0].transcript, e.results[i].isFinal);
-            }
-        };
+        try {
+            this.stream = await navigator.mediaDevices.getUserMedia({ audio: true });
 
-        r.onerror = (e: any) => {
-            console.error('[SpeechEngine]', e.error);
-            this.onErrorCb?.(e.error as string);
-            if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
-                this._active = false; this._stopping = true;
-                this.onEndCb?.();
-            }
-            // other errors: let onend handle reconnect
-        };
+            const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+                ? 'audio/webm;codecs=opus'
+                : 'audio/webm';
 
-        r.onend = () => {
-            if (this._restartTmr) { clearTimeout(this._restartTmr); this._restartTmr = null; }
+            this.mediaRecorder = new MediaRecorder(this.stream, { mimeType });
+            this.audioChunks = [];
 
-            if (!this._active || this._stopping) {
-                // Explicit stop — notify caller
-                this.rec = null;
-                this.onEndCb?.();
-                return;
-            }
+            this.mediaRecorder.ondataavailable = (event) => {
+                if (event.data.size > 0) {
+                    this.audioChunks.push(event.data);
+                }
+            };
 
-            // Unexpected end (silence timeout / network blip) — auto-restart
-            console.log('[SpeechEngine] Unexpected end, rebuilding in 500ms…');
-            this.rec = null; // free GC so Mojo handles are released
+            this.mediaRecorder.onstop = () => {
+                const mime = this.mediaRecorder?.mimeType || 'audio/webm';
+                const audioBlob = new Blob(this.audioChunks, { type: mime });
+                this.onEndCb?.(audioBlob, mime);
 
-            this._restartTmr = setTimeout(() => {
-                if (!this._active || this._stopping) return;
-                this._build();
-                try { this.rec?.start(); } catch (_) { }
-            }, 500); // ← 500ms = safe OS audio device release window
-        };
+                if (this.stream) {
+                    this.stream.getTracks().forEach(t => t.stop());
+                    this.stream = null;
+                }
+            };
 
-        this.rec = r;
+            this.mediaRecorder.onerror = (e: any) => {
+                console.error('[SpeechEngine] Error:', e);
+                this.onErrorCb?.(e.error?.message || 'Recording failed');
+            };
+
+            this.mediaRecorder.start();
+            this._active = true;
+        } catch (err: any) {
+            console.error('[SpeechEngine] start error:', err);
+            this.onErrorCb?.(err.message || 'Microphone access denied');
+            this._active = false;
+        }
     }
 
-    start(): void {
-        if (!this.Ctor) { console.error('[SpeechEngine] Call initialize() first.'); return; }
-        this._stopping = false;
-        this._active = true;
-        this._build();                        // fresh instance every time
-        try { this.rec.start(); }
-        catch (e: any) { if (e.name !== 'InvalidStateError') throw e; }
-    }
-
-    /**
-     * Explicit stop — called when user presses mic or shortcut.
-     * Uses abort() NOT stop() to prevent flushing remaining audio
-     * through the Mojo DataPipe (which causes Error: -2 if a new
-     * session has already started).
-     */
     stop(): void {
-        if (this._restartTmr) { clearTimeout(this._restartTmr); this._restartTmr = null; }
-        this._stopping = true;
+        if (!this._active || !this.mediaRecorder) return;
         this._active = false;
-        this._doAbort();
-        setTimeout(() => this.onEndCb?.(), 0); // synchronous notify
+
+        try {
+            if (this.mediaRecorder.state !== 'inactive') {
+                this.mediaRecorder.stop();
+            }
+        } catch (err) {
+            console.error('[SpeechEngine] stop error:', err);
+        }
     }
 
-    private _doAbort(): void {
-        try { this.rec?.abort(); } catch (_) { }
-        this.rec = null;
-    }
-
-    onResult(cb: (text: string, isFinal: boolean) => void) { this.onResultCb = cb; }
-    onEnd(cb: () => void) { this.onEndCb = cb; }
+    onEnd(cb: (audioBlob: Blob, mimeType: string) => void) { this.onEndCb = cb; }
     onError(cb: (err: string) => void) { this.onErrorCb = cb; }
 
-    get running() { return this._active && !this._stopping; }
+    get running() { return this._active; }
 }
 
 export const speechEngine = new SpeechEngine();

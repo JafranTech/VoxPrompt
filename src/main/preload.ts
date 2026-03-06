@@ -9,6 +9,7 @@ contextBridge.exposeInMainWorld('voxprompt', {
     // ── Renderer → Main (request/response) ───────────────────────────────────
     injectText: (text: string) => ipcRenderer.invoke('inject-text', text),
     optimizePrompt: (text: string) => ipcRenderer.invoke('optimize-prompt', text),
+    transcribeAudio: (base64Audio: string, mimeType: string) => ipcRenderer.invoke('transcribe-audio', base64Audio, mimeType),
     resizeWindow: (w: number, h: number) => ipcRenderer.invoke('resize-window', { width: w, height: h }),
     hideWindow: () => ipcRenderer.invoke('hide-window'),
 

@@ -5,6 +5,7 @@
 import { ipcMain, clipboard, BrowserWindow } from 'electron';
 import { exec } from 'child_process';
 import { optimizePrompt } from '../agents/promptOptimizer';
+import { transcribeAudio } from '../agents/speechTranscriber';
 
 export function setupIPC(mainWindow: BrowserWindow): void {
 
@@ -48,6 +49,16 @@ export function setupIPC(mainWindow: BrowserWindow): void {
         } catch (err) {
             console.error('[IPC] optimize-prompt error:', err);
             return rawText;
+        }
+    });
+
+    // ── transcribe-audio ─────────────────────────────────────────────────────────
+    ipcMain.handle('transcribe-audio', async (_e, base64Audio: string, mimeType: string) => {
+        try {
+            return await transcribeAudio(base64Audio, mimeType);
+        } catch (err) {
+            console.error('[IPC] transcribe-audio error:', err);
+            throw err;
         }
     });
 

@@ -15,6 +15,7 @@ import { transliterateTamil } from '../../engines/tamilTranslit';
 interface VoxBridge {
     injectText: (text: string) => Promise<void>;
     optimizePrompt: (text: string) => Promise<string>;
+    transcribeAudio: (base64Audio: string, mimeType: string) => Promise<string>;
     hideWindow: () => Promise<void>;
     onStartRecording: (cb: () => void) => () => void;
     onStopAndInject: (cb: () => void) => () => void;
@@ -27,6 +28,7 @@ const NO_OP_UNSUB = () => { };
 const VOX_STUB: VoxBridge = {
     injectText: async () => { },
     optimizePrompt: async (t) => t,
+    transcribeAudio: async () => '',
     hideWindow: async () => { },
     onStartRecording: () => NO_OP_UNSUB,
     onStopAndInject: () => NO_OP_UNSUB,
@@ -37,7 +39,7 @@ const vox = (): VoxBridge => (window as any).voxprompt ?? VOX_STUB;
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 type Lang = 'english' | 'tamil';
-type Status = 'idle' | 'recording' | 'optimizing' | 'injecting' | 'error';
+type Status = 'idle' | 'recording' | 'transcribing' | 'optimizing' | 'injecting' | 'error';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 const noop = () => { };
@@ -53,7 +55,6 @@ export default function FloatingPopup() {
     const transcriptRef = useRef('');
     useEffect(() => { transcriptRef.current = transcript; }, [transcript]);
 
-    // Accumulate finalized speech segments across utterance boundaries
     const finalizedRef = useRef('');
 
     // Wave animation while recording
@@ -70,57 +71,83 @@ export default function FloatingPopup() {
     };
 
     // ─── startRecording ──────────────────────────────────────────────────────────
-    const startRecording = useCallback(() => {
+    const startRecording = useCallback(async () => {
         if (speechEngine.running) return;
 
         finalizedRef.current = '';
         setTranscript('');
         setErrMsg('');
 
-        const ok = speechEngine.initialize(lang === 'tamil' ? 'ta-IN' : 'en-US');
+        const ok = await speechEngine.initialize();
         if (!ok) {
             setStatus('error');
-            setErrMsg('Speech API unavailable. Ensure app is served from localhost.');
+            setErrMsg('Microphone access denied. Grant permission in OS settings.');
             return;
         }
 
-        let finalized = '';
-
-        speechEngine.onResult((text, isFinal) => {
-            // Apply Tamil transliteration if needed
-            const processed = lang === 'tamil' ? transliterateTamil(text) : text;
-
-            if (isFinal) {
-                finalized += processed + ' ';
-                finalizedRef.current = finalized;
-                setTranscript(finalized.trim());
-            } else {
-                setTranscript((finalized + processed).trim());
-            }
-        });
-
-        speechEngine.onEnd(() => {
-            setStatus('idle');
+        speechEngine.onEnd(async (audioBlob, mimeType) => {
             stopWave();
+            setStatus('transcribing');
+
+            try {
+                const reader = new FileReader();
+                reader.readAsDataURL(audioBlob);
+                reader.onloadend = async () => {
+                    const base64data = reader.result as string;
+                    const base64Audio = base64data.split(',')[1];
+
+                    try {
+                        let text = await vox().transcribeAudio(base64Audio, mimeType);
+                        if (lang === 'tamil') {
+                            text = transliterateTamil(text);
+                        }
+
+                        setTranscript(text);
+                        finalizedRef.current = text;
+                        setStatus('idle');
+
+                        // Automatically inject
+                        if (text) {
+                            setStatus('injecting');
+                            try {
+                                await vox().injectText(text);
+                            } catch (e) {
+                                console.error('Injection failed', e);
+                            }
+                            setTranscript('');
+                            finalizedRef.current = '';
+                            setStatus('idle'); // Window hides automatically
+                        }
+                    } catch (e: any) {
+                        setStatus('error');
+                        setErrMsg(e.message || 'Transcription failed');
+                    }
+                };
+            } catch (err) {
+                setStatus('error');
+                setErrMsg('Failed to process recorded audio');
+            }
         });
 
         speechEngine.onError((err) => {
-            if (err === 'not-allowed' || err === 'service-not-allowed') {
-                setStatus('error');
-                setErrMsg('Microphone access denied. Grant permission in OS settings.');
-                stopWave();
-            }
+            setStatus('error');
+            setErrMsg(err);
+            stopWave();
         });
 
-        speechEngine.start();
+        await speechEngine.start();
         setStatus('recording');
         startWave();
     }, [lang]);
 
     // ─── stopAndInject ────────────────────────────────────────────────────────────
     const stopAndInject = useCallback(async () => {
-        speechEngine.stop();
-        stopWave();
+        if (speechEngine.running) {
+            // Stopping triggers onEnd, which transcribes and auto-injects
+            speechEngine.stop();
+            return;
+        }
+
         setStatus('injecting');
 
         const text = (finalizedRef.current || transcriptRef.current).trim();
@@ -137,7 +164,6 @@ export default function FloatingPopup() {
         setTranscript('');
         finalizedRef.current = '';
         setStatus('idle');
-        // Window is hidden by main on Ctrl+Shift+Space toggle
     }, []);
 
     // ─── IPC listeners ────────────────────────────────────────────────────────────
@@ -152,27 +178,30 @@ export default function FloatingPopup() {
         });
         return () => { unsub1?.(); unsub2?.(); unsub3?.(); };
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, []); // mount once — startRecording/stopAndInject captured via refs below
+    }, []);
 
     // ─── Colour helpers ───────────────────────────────────────────────────────────
     const isRecording = status === 'recording';
+    const isTranscribing = status === 'transcribing';
     const isOptimizing = status === 'optimizing';
     const isInjecting = status === 'injecting';
     const isError = status === 'error';
 
     const statusColor =
         isRecording ? '#89E900' :
-            isOptimizing ? '#FFB800' :
-                isInjecting ? '#00C8FF' :
-                    isError ? '#FF4545' :
-                        '#555';
+            isTranscribing ? '#00C8FF' :
+                isOptimizing ? '#FFB800' :
+                    isInjecting ? '#00C8FF' :
+                        isError ? '#FF4545' :
+                            '#555';
 
     const statusLabel =
         isRecording ? '● RECORDING' :
-            isOptimizing ? '⚙ OPTIMIZING…' :
-                isInjecting ? '↗ INJECTING…' :
-                    isError ? `✕ ${errMsg}` :
-                        'TAP TO SPEAK';
+            isTranscribing ? '⏳ TRANSCRIBING…' :
+                isOptimizing ? '⚙ OPTIMIZING…' :
+                    isInjecting ? '↗ INJECTING…' :
+                        isError ? `✕ ${errMsg}` :
+                            'TAP TO SPEAK';
 
     // ─── Render ───────────────────────────────────────────────────────────────────
     return (
@@ -210,8 +239,8 @@ export default function FloatingPopup() {
                 <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
                     <div style={{
                         width: '8px', height: '8px', borderRadius: '50%',
-                        background: isError ? '#FF4545' : isRecording ? '#89E900' : '#444',
-                        boxShadow: isRecording ? '0 0 8px #89E900, 0 0 18px rgba(137,233,0,0.5)' : 'none',
+                        background: isError ? '#FF4545' : ((isRecording || isTranscribing) ? '#89E900' : '#444'),
+                        boxShadow: (isRecording || isTranscribing) ? '0 0 8px #89E900, 0 0 18px rgba(137,233,0,0.5)' : 'none',
                         transition: 'all 0.3s',
                         animation: isRecording ? 'pulse 1.5s ease-in-out infinite' : 'none',
                     }} />
@@ -232,12 +261,12 @@ export default function FloatingPopup() {
                 {(['english', 'tamil'] as Lang[]).map((l) => (
                     <button
                         key={l}
-                        disabled={isRecording}
+                        disabled={isRecording || isTranscribing}
                         onClick={() => setLang(l)}
                         style={{
                             flex: 1, padding: '8px', borderRadius: '10px', border: 'none',
                             fontSize: '13px', fontWeight: 600, letterSpacing: '0.5px',
-                            cursor: isRecording ? 'not-allowed' : 'pointer',
+                            cursor: (isRecording || isTranscribing) ? 'not-allowed' : 'pointer',
                             transition: 'all 0.2s',
                             background: lang === l ? 'rgba(137,233,0,0.15)' : 'rgba(255,255,255,0.04)',
                             color: lang === l ? '#89E900' : '#666',
@@ -254,12 +283,12 @@ export default function FloatingPopup() {
                 <button
                     id="mic-btn"
                     onClick={isRecording ? stopAndInject : startRecording}
-                    disabled={isOptimizing || isInjecting}
-                    title={isRecording ? 'Stop & inject text' : 'Start voice recording'}
+                    disabled={isTranscribing || isOptimizing || isInjecting}
+                    title={isRecording ? 'Stop & interpret audio' : 'Start voice recording'}
                     style={{
                         width: '84px', height: '84px', borderRadius: '50%',
                         border: isRecording ? '2px solid rgba(137,233,0,0.6)' : '2px solid rgba(255,255,255,0.08)',
-                        cursor: (isOptimizing || isInjecting) ? 'not-allowed' : 'pointer',
+                        cursor: (isTranscribing || isOptimizing || isInjecting) ? 'not-allowed' : 'pointer',
                         background: isRecording
                             ? 'linear-gradient(135deg, #89E900, #6CC400)'
                             : 'linear-gradient(135deg, #2A2A2A, #1E1E1E)',
@@ -304,6 +333,7 @@ export default function FloatingPopup() {
                     setTranscript(e.target.value);
                     finalizedRef.current = e.target.value;
                 }}
+                disabled={isRecording || isTranscribing}
                 placeholder="Your speech will appear here…&#10;Start speaking after pressing the mic."
                 style={{
                     flex: 1,
@@ -320,6 +350,7 @@ export default function FloatingPopup() {
                     marginBottom: '14px',
                     boxShadow: 'inset 0 2px 8px rgba(0,0,0,0.4)',
                     transition: 'border-color 0.2s',
+                    opacity: (isRecording || isTranscribing) ? 0.6 : 1,
                 }}
                 onFocus={(e) => e.currentTarget.style.borderColor = 'rgba(137,233,0,0.3)'}
                 onBlur={(e) => e.currentTarget.style.borderColor = 'rgba(255,255,255,0.07)'}
@@ -330,8 +361,8 @@ export default function FloatingPopup() {
                 {/* Inject raw text */}
                 <button
                     onClick={stopAndInject}
-                    disabled={!transcript.trim() || status === 'injecting'}
-                    style={btnStyle('ghost', !transcript.trim() || status === 'injecting')}
+                    disabled={!transcript.trim() || status === 'injecting' || isRecording || isTranscribing}
+                    style={btnStyle('ghost', !transcript.trim() || status === 'injecting' || isRecording || isTranscribing)}
                     title="Stop recording and inject raw text into active app"
                 >
                     ↗ Inject
@@ -340,7 +371,7 @@ export default function FloatingPopup() {
                 {/* Convert to Prompt */}
                 <button
                     id="convert-btn"
-                    disabled={!transcript.trim() || isOptimizing}
+                    disabled={!transcript.trim() || isOptimizing || isRecording || isTranscribing}
                     onClick={async () => {
                         const text = transcriptRef.current.trim();
                         if (!text) return;
@@ -357,7 +388,7 @@ export default function FloatingPopup() {
                             setStatus('idle');
                         }
                     }}
-                    style={btnStyle('primary', !transcript.trim() || isOptimizing)}
+                    style={btnStyle('primary', !transcript.trim() || isOptimizing || isRecording || isTranscribing)}
                 >
                     {isOptimizing ? '⚙ Optimizing…' : '✦ Convert to Prompt'}
                 </button>
